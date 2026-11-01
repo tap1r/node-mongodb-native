@@ -73,6 +73,7 @@ import { compareTopologyVersion, ServerDescription } from './server_description'
 import {
   applyUserServerSelector,
   DeprioritizedServers,
+  operationSkipsUserServerSelector,
   readPreferenceServerSelector,
   type ServerSelector,
   type ServerSelectorFunction
@@ -560,7 +561,9 @@ export class Topology extends TypedEventEmitter<TopologyEvents> {
       serverSelector = selector;
     }
 
-    serverSelector = applyUserServerSelector(serverSelector, this.s.options.serverSelector);
+    if (!operationSkipsUserServerSelector(options.operationName)) {
+      serverSelector = applyUserServerSelector(serverSelector, this.s.options.serverSelector);
+    }
 
     options = { serverSelectionTimeoutMS: this.s.serverSelectionTimeoutMS, ...options };
     if (

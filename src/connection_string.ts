@@ -315,6 +315,12 @@ export function parseOptions(
     );
   }
 
+  if (urlOptions.has('serverSelector')) {
+    throw new MongoParseError(
+      'URI cannot contain `serverSelector`, it can only be passed to the client'
+    );
+  }
+
   const uriMechanismProperties = urlOptions.get('authMechanismProperties');
   if (uriMechanismProperties) {
     for (const property of uriMechanismProperties) {

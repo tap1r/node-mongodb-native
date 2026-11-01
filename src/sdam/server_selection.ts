@@ -25,7 +25,10 @@ export type ServerSelector = (
  * The Node driver calls this after read preference, tag, and max-staleness
  * filtering and before `localThresholdMS`.
  *
- * @param servers - Servers that already satisfy the operation's selection rules.
+ * The argument is a list of copies. Return servers from that list. An empty
+ * array selects nothing. A server that was not in the list is rejected.
+ *
+ * @param servers - Copies of the servers that already satisfy the operation's selection rules.
  * @returns The servers to consider. A one-element array targets that member.
  * @public
  */
@@ -282,6 +285,60 @@ const TOPOLOGIES_IGNORING_USER_SERVER_SELECTOR = new Set<TopologyType>([
 ]);
 
 /**
+ * Connect and session cleanup must be able to use any suitable server. A user
+ * filter that returns no server would otherwise time out `MongoClient.connect`
+ * and skip `endSessions` on close.
+ * @internal
+ */
+export function operationSkipsUserServerSelector(operationName: string | undefined): boolean {
+  return operationName === 'handshake' || operationName === 'endSessions';
+}
+
+/**
+ * The user function must not be able to mutate the topology's descriptions.
+ * Selection maps the result back to the instances it passed in.
+ */
+function copyServerDescription(server: ServerDescription): ServerDescription {
+  const copy: ServerDescription = Object.assign(
+    Object.create(Object.getPrototypeOf(server)),
+    server
+  );
+  copy.hosts = server.hosts.slice();
+  copy.passives = server.passives.slice();
+  copy.arbiters = server.arbiters.slice();
+  copy.tags = { ...server.tags };
+  return copy;
+}
+
+/**
+ * Keeps only servers from `eligible`, in the order the user returned them.
+ * A returned address that was not eligible is a programming error: accepting
+ * it would let the function bypass read preference, staleness, and deprioritization.
+ */
+function serversReturnedByUser(
+  eligible: ServerDescription[],
+  selected: ServerDescription[]
+): ServerDescription[] {
+  const eligibleByAddress = new Map(eligible.map(server => [server.address, server]));
+  const narrowed: ServerDescription[] = [];
+  const seen = new Set<string>();
+  for (const server of selected) {
+    const match = eligibleByAddress.get(server.address);
+    if (match == null) {
+      throw new MongoInvalidArgumentError(
+        `serverSelector returned ${server.address}, which is not eligible for this operation`
+      );
+    }
+    if (seen.has(server.address)) {
+      continue;
+    }
+    seen.add(server.address);
+    narrowed.push(match);
+  }
+  return narrowed;
+}
+
+/**
  * Built-in selectors apply the latency window before returning. Copy the
  * description with an unlimited window so a user filter can still see, and
  * choose, a slower eligible member. The real window is applied to the filter's
@@ -335,7 +392,7 @@ export function applyUserServerSelector(
       return [];
     }
 
-    const selected = userServerSelector(eligible);
+    const selected = userServerSelector(eligible.map(copyServerDescription));
     if (!isServerDescriptionList(selected)) {
       throw new MongoInvalidArgumentError(
         'serverSelector must return an array of server descriptions'
@@ -344,7 +401,11 @@ export function applyUserServerSelector(
     if (selected.length === 0) {
       return [];
     }
-    return latencyWindowReducer(topologyDescription, selected);
+    const narrowed = serversReturnedByUser(eligible, selected);
+    if (narrowed.length === 0) {
+      return [];
+    }
+    return latencyWindowReducer(topologyDescription, narrowed);
   };
 }
 

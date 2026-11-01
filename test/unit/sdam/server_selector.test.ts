@@ -16,7 +16,8 @@ import {
   ServerDescription,
   type ServerSelectorFunction,
   TopologyDescription,
-  TopologyType
+  TopologyType,
+  writableServerSelector
 } from '../../mongodb';
 import { topologyWithPlaceholderClient } from '../../tools/utils';
 
@@ -95,7 +96,7 @@ describe('serverSelector', function () {
     it('rejects the option in a connection string', function () {
       expect(() => parseOptions('mongodb://localhost:27017/?serverSelector=host')).to.throw(
         MongoParseError,
-        /serverSelector must be a function/
+        /URI cannot contain `serverSelector`, it can only be passed to the client/
       );
     });
   });
@@ -249,6 +250,72 @@ describe('serverSelector', function () {
       ).to.throw(MongoInvalidArgumentError, /array of server descriptions/);
     });
 
+    it('gives the filter copies and selects the eligible instances', function () {
+      let seen: ServerDescription[] = [];
+      const selector = applyUserServerSelector(readPreferenceNearest(), servers => {
+        seen = servers;
+        servers[0].roundTripTime = 999;
+        servers[0].tags.nodeType = 'analytics';
+        servers[0].hosts.push('evil:27017');
+        return servers;
+      });
+
+      const selected = selector(
+        description(TopologyType.ReplicaSetWithPrimary, [primary, secondary, slowSecondary]),
+        [primary, secondary, slowSecondary],
+        new DeprioritizedServers()
+      );
+
+      expect(seen[0]).to.not.equal(primary);
+      expect(primary.roundTripTime).to.equal(10);
+      expect(primary.tags).to.deep.equal({});
+      expect(primary.hosts).to.deep.equal([]);
+      expect(selected[0]).to.equal(primary);
+      expect(selected[1]).to.equal(secondary);
+    });
+
+    it('rejects a server that was not eligible', function () {
+      const other = member('127.0.0.1:27999', 'secondary', 1);
+      const selector = applyUserServerSelector(readPreference(ReadPreference.primary), () => [
+        other
+      ]);
+
+      expect(() =>
+        selector(
+          description(TopologyType.ReplicaSetWithPrimary, [primary, other]),
+          [primary, other],
+          new DeprioritizedServers()
+        )
+      ).to.throw(MongoInvalidArgumentError, /127\.0\.0\.1:27999, which is not eligible/);
+    });
+
+    it('rejects a secondary returned for a write', function () {
+      const selector = applyUserServerSelector(writableServerSelector(), () => [secondary]);
+
+      expect(() =>
+        selector(
+          description(TopologyType.ReplicaSetWithPrimary, [primary, secondary]),
+          [primary, secondary],
+          new DeprioritizedServers()
+        )
+      ).to.throw(MongoInvalidArgumentError, /not eligible/);
+    });
+
+    it('selects the eligible server when the filter returns another object with its address', function () {
+      const selector = applyUserServerSelector(readPreferenceNearest(), () => [
+        { address: slowSecondary.address, roundTripTime: 0 } as ServerDescription
+      ]);
+
+      const selected = selector(
+        description(TopologyType.ReplicaSetWithPrimary, [primary, secondary, slowSecondary]),
+        [primary, secondary, slowSecondary],
+        new DeprioritizedServers()
+      );
+
+      expect(selected).to.have.lengthOf(1);
+      expect(selected[0]).to.equal(slowSecondary);
+    });
+
     it('returns an empty list when the filter returns an empty list', function () {
       const selector = applyUserServerSelector(readPreferenceNearest(), () => []);
       const selected = selector(
@@ -339,6 +406,46 @@ describe('serverSelector', function () {
 
       expect(error).to.be.instanceOf(Error);
       expect(error.message).to.equal('selector failed');
+    });
+
+    it('does not call the filter for the connect handshake', async function () {
+      let calls = 0;
+      const topology = topologyWithPlaceholderClient('127.0.0.1:27017', {
+        serverSelectionTimeoutMS: 500,
+        serverSelector() {
+          calls += 1;
+          return [];
+        }
+      });
+      install(topology, TopologyType.ReplicaSetWithPrimary, [primary]);
+
+      const selected = await topology.selectServer(ReadPreference.primary, {
+        operationName: 'handshake',
+        deprioritizedServers: new DeprioritizedServers()
+      });
+
+      expect(calls).to.equal(0);
+      expect(selected).to.equal(topology.s.servers.get(primary.address));
+    });
+
+    it('does not call the filter for endSessions', async function () {
+      let calls = 0;
+      const topology = topologyWithPlaceholderClient('127.0.0.1:27017', {
+        serverSelectionTimeoutMS: 500,
+        serverSelector() {
+          calls += 1;
+          throw new Error('serverSelector must not run while ending sessions');
+        }
+      });
+      install(topology, TopologyType.ReplicaSetWithPrimary, [primary]);
+
+      const selected = await topology.selectServer(ReadPreference.primaryPreferred, {
+        operationName: 'endSessions',
+        deprioritizedServers: new DeprioritizedServers()
+      });
+
+      expect(calls).to.equal(0);
+      expect(selected).to.equal(topology.s.servers.get(primary.address));
     });
 
     it('times out when the filter returns no servers', async function () {

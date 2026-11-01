@@ -50,7 +50,6 @@ import { type Runtime, type RuntimeAdapters } from './runtime_adapters';
 import type { ServerMonitoringMode } from './sdam/monitor';
 import type { TagSet } from './sdam/server_description';
 import {
-  applyUserServerSelector,
   DeprioritizedServers,
   readPreferenceServerSelector,
   type ServerSelectorFunction
@@ -227,17 +226,28 @@ export interface MongoClientOptions extends BSONSerializeOptions, SupportedNodeC
   /**
    * Further filters the servers eligible for an operation.
    *
-   * The driver calls this with the servers that already satisfy the operation's
-   * read preference, tags, and max staleness. Return the subset to consider.
-   * The driver then applies `localThresholdMS`. Return a one-element array to
-   * send those operations to one member of a replica set or sharded cluster.
+   * The driver calls this with copies of the servers that already satisfy the
+   * operation's read preference, tags, and max staleness. Return a subset of
+   * that array. The driver then applies `localThresholdMS` and chooses within
+   * the result. Return a one-element array to send those operations to one
+   * member of a replica set or sharded cluster. Array order is not a preference.
+   *
+   * Returning a server that was not in the argument throws
+   * `MongoInvalidArgumentError`. Return an empty array when none of the
+   * eligible servers are acceptable. Mutating a description does not change
+   * the topology. The driver selects the matching eligible server.
    *
    * Writes only see writable servers, so this cannot redirect a write to a
    * secondary. Use `directConnection` to talk to one host as a standalone.
    *
    * The function is not called when the topology is Single (`directConnection`)
    * or LoadBalanced, when no server is eligible, or for operations pinned to a
-   * server, such as `getMore` and `killCursors`.
+   * server, such as `getMore` and `killCursors`. It is also not called for the
+   * connect handshake or `endSessions`. A filter that returns an empty array
+   * can still connect, and close can still end pooled sessions.
+   *
+   * On a replica set, a transaction is not pinned to the first server. Return
+   * one server for every operation in the transaction.
    *
    * This is not a connection-string option. Pass it to the `MongoClient` constructor.
    * It matches PyMongo's `server_selector` keyword.
@@ -842,11 +852,9 @@ export class MongoClient extends TypedEventEmitter<MongoClientEvents> implements
       { description: topologyDescription }: Topology
     ) {
       // If we would attempt to select a server and get nothing back we short circuit
-      // to avoid the server selection timeout.
-      const selector = applyUserServerSelector(
-        readPreferenceServerSelector(ReadPreference.primaryPreferred),
-        client.options.serverSelector
-      );
+      // to avoid the server selection timeout. This check ignores `serverSelector`:
+      // session cleanup must run even when the filter would select no server.
+      const selector = readPreferenceServerSelector(ReadPreference.primaryPreferred);
       const serverDescriptions = Array.from(topologyDescription.servers.values());
       const servers = selector(topologyDescription, serverDescriptions, new DeprioritizedServers());
       if (servers.length !== 0) {
