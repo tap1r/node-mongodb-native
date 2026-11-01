@@ -264,40 +264,98 @@ export interface MongoClientOptions extends BSONSerializeOptions, SupportedNodeC
   /** Specifies how long (in milliseconds) to block for server selection before throwing an exception.  */
   serverSelectionTimeoutMS?: number;
   /**
-   * Further filters the servers eligible for an operation.
+   * Further filters the servers that are already eligible for an operation.
    *
-   * The driver calls this with copies of the servers that already satisfy the
-   * operation's read preference, tags, and max staleness. Return a subset of
-   * that array. The driver then applies `localThresholdMS` and chooses within
-   * the result. Return a one-element array to send those operations to one
-   * member of a replica set or sharded cluster. Array order is not a preference.
+   * The driver first applies the operation's read preference, tag sets, max
+   * staleness, and deprioritized-server rules. It then calls this function
+   * with copies of the servers that remain, and only after the function
+   * returns does it apply `localThresholdMS`. Array order is not a preference.
+   * Inside the latency window the driver still chooses by current operation
+   * count. Return a one-element array to send the operation to that member.
+   * Returning one slower member keeps it: that member becomes the low end of
+   * the window. Returning it together with a faster member can drop it again.
    *
-   * Returning a server that was not in the argument throws
-   * `MongoInvalidArgumentError`. Return an empty array when none of the
-   * eligible servers are acceptable. Mutating a description does not change
-   * the topology. The driver selects the matching eligible server.
+   * Return only servers from the array you were given. A server from an
+   * earlier call, or any other address, throws `MongoInvalidArgumentError`.
+   * An empty array means none of the eligible servers are acceptable.
+   * Selection then waits until `serverSelectionTimeoutMS` and throws
+   * `MongoServerSelectionError`. Prefer `return preferred ? [preferred] : servers`
+   * when the member is a preference. Use `[]` only when the operation must
+   * not run anywhere else.
    *
-   * Writes only see writable servers, so this cannot redirect a write to a
-   * secondary. Use `directConnection` to talk to one host as a standalone.
+   * The descriptions are copies. Editing `roundTripTime`, `tags`, `hosts`,
+   * `electionId`, `topologyVersion`, `$clusterTime`, or `error` does not
+   * change the topology. The driver selects the original server with the same
+   * address, not the object you return. Do not keep the copies for a later
+   * call. The next selection builds new ones, and a saved description whose
+   * address is no longer eligible is rejected.
    *
-   * The function is not called when the topology is Single (`directConnection`)
-   * or LoadBalanced, when no server is eligible, or for operations pinned to a
-   * server, such as `getMore` and `killCursors`. It is also not called for the
-   * connect handshake or `endSessions`. A filter that returns an empty array
-   * can still connect, and close can still end pooled sessions.
+   * What a call is allowed to see depends on the operation:
    *
-   * On a replica set, a transaction is not pinned to the first server. Return
-   * one server for every operation in the transaction.
+   * - `insertOne`, `updateOne`, `deleteOne`, and other ordinary writes are
+   *   offered writable servers only. On a replica set that is the primary, so
+   *   this function cannot send those writes to a secondary.
+   * - An aggregate that writes (`$out` or `$merge`) can be offered secondaries
+   *   when its read preference allows that and the members are new enough.
+   *   Returning one of those secondaries does send the aggregate there.
+   * - A `find` or a read aggregate is offered the servers that match its read
+   *   preference. `primary` sees only the primary. `nearest` sees every
+   *   suitable member, including members outside `localThresholdMS`.
    *
-   * This is not a connection-string option. Pass it to the `MongoClient` constructor.
-   * It matches PyMongo's `server_selector` keyword.
+   * The function is not called for a Single topology (`directConnection`), a
+   * LoadBalanced topology, or when no server is eligible. It is not called for
+   * an operation pinned to a server (`getMore`, `killCursors`). It is not
+   * called for the connect handshake or for `endSessions`, so a function that
+   * returns an empty array can still `connect()` and `close()` can still end
+   * pooled sessions.
    *
-   * @example
+   * Transactions on a replica set use read preference primary, so the function
+   * only sees the primary. On a sharded cluster the function runs for the
+   * first command in the transaction. The driver then pins that mongos, and
+   * later commands in the transaction reuse it without calling the function.
+   *
+   * This is not a connection-string option. Pass it to the `MongoClient`
+   * constructor. It matches PyMongo's `server_selector` keyword.
+   *
+   * @example Prefer one member, and keep the rest of the eligible list when it is absent
    * ```ts
+   * // nearest reads that can see db-2 use db-2. Writes still see only the
+   * // primary, so they return that primary instead of waiting out the
+   * // selection timeout.
    * new MongoClient(uri, {
+   *   readPreference: 'nearest',
+   *   serverSelector(servers) {
+   *     const preferred = servers.find(server => server.address === 'db-2.example.com:27017');
+   *     return preferred ? [preferred] : servers;
+   *   }
+   * });
+   * ```
+   *
+   * @example Require one member for operations that are allowed to use it
+   * ```ts
+   * // [] waits until serverSelectionTimeoutMS. A primary write is only offered
+   * // the primary, so this times out those writes while db-2 is a secondary.
+   * // Use it when a read must not fall back to another member.
+   * new MongoClient(uri, {
+   *   readPreference: 'nearest',
    *   serverSelector(servers) {
    *     const member = servers.find(server => server.address === 'db-2.example.com:27017');
    *     return member ? [member] : [];
+   *   }
+   * });
+   * ```
+   *
+   * @example Choose one mongos, or one secondary for a writing aggregate
+   * ```ts
+   * // Every eligible mongos is passed in. Returning one sends the command
+   * // there and leaves the others for the next call that does not match.
+   * // The same shape works for an aggregate with `$out` or `$merge`: the
+   * // eligible list may contain secondaries, and returning one of them runs
+   * // that aggregate on it.
+   * new MongoClient(uri, {
+   *   serverSelector(servers) {
+   *     const chosen = servers.find(server => server.address === 'mongos-a.example.com:27017');
+   *     return chosen ? [chosen] : servers;
    *   }
    * });
    * ```

@@ -19,6 +19,7 @@ export const {
   AggregateOperation,
   AggregationCursor,
   applySession,
+  applyUserServerSelector,
   Aspect,
   AUTH_MECHS_AUTH_SRC_EXTERNAL,
   AuthContext,

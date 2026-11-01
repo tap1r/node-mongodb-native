@@ -1,7 +1,15 @@
-import { MongoInvalidArgumentError, MongoRuntimeError } from '../error';
+import { Binary, Long, ObjectId, Timestamp } from '../bson';
+import {
+  MongoError,
+  MongoInvalidArgumentError,
+  MongoNetworkError,
+  type MongoNetworkErrorOptions,
+  MongoRuntimeError,
+  MongoServerError
+} from '../error';
 import { ReadPreference } from '../read_preference';
-import { ServerType, TopologyType } from './common';
-import type { ServerDescription, TagSet } from './server_description';
+import { type ClusterTime, ServerType, TopologyType } from './common';
+import type { ServerDescription, TagSet, TopologyVersion } from './server_description';
 import type { TopologyDescription } from './topology_description';
 
 // max staleness constants
@@ -25,8 +33,10 @@ export type ServerSelector = (
  * The Node driver calls this after read preference, tag, and max-staleness
  * filtering and before `localThresholdMS`.
  *
- * The argument is a list of copies. Return servers from that list. An empty
- * array selects nothing. A server that was not in the list is rejected.
+ * The argument is a list of copies, including `electionId`, `topologyVersion`,
+ * `$clusterTime`, and `error`. Return servers from that list. An empty array
+ * selects nothing and the operation waits until `serverSelectionTimeoutMS`.
+ * A server that was not in the list is rejected.
  *
  * @param servers - Copies of the servers that already satisfy the operation's selection rules.
  * @returns The servers to consider. A one-element array targets that member.
@@ -295,8 +305,23 @@ export function operationSkipsUserServerSelector(operationName: string | undefin
 }
 
 /**
- * The user function must not be able to mutate the topology's descriptions.
- * Selection maps the result back to the instances it passed in.
+ * `Object.assign` copies the description by reference for every object field.
+ * Several of those objects are the topology's own state, not a snapshot:
+ *
+ * - `TopologyDescription.updateRsFromPrimary` keeps `electionId` and later
+ *   compares it with the next hello.
+ * - `isStaleServerDescription` reads `topologyVersion` off the stored
+ *   description, so editing `counter` or `processId` can make a newer hello
+ *   look stale.
+ * - `_advanceClusterTime` stores the hello `$clusterTime` object and later
+ *   writes that same object on the wire.
+ * - `error` is the hello failure itself. `error.topologyVersion` is often the
+ *   same object as `description.topologyVersion`.
+ *
+ * A caller that follows the public contract and edits any of those in place
+ * would change server selection and cluster-time gossip for every later
+ * operation. Replace each of them with a value the callback can edit freely.
+ * Selection still returns the original descriptions, matched by address.
  */
 function copyServerDescription(server: ServerDescription): ServerDescription {
   const copy: ServerDescription = Object.assign(
@@ -307,6 +332,118 @@ function copyServerDescription(server: ServerDescription): ServerDescription {
   copy.passives = server.passives.slice();
   copy.arbiters = server.arbiters.slice();
   copy.tags = { ...server.tags };
+  copy.electionId = server.electionId == null ? null : copyObjectId(server.electionId);
+  copy.topologyVersion =
+    server.topologyVersion == null ? null : copyTopologyVersion(server.topologyVersion);
+  copy.$clusterTime = copyClusterTime(server.$clusterTime);
+  copy.error = server.error == null ? null : copyError(server.error);
+  return copy;
+}
+
+/**
+ * Builds a new ObjectId from a copy of the 12 id bytes.
+ *
+ * Current BSON stores an ObjectId as four packed integers, and
+ * `new ObjectId(existing)` copies those integers. `.id` also returns a new
+ * buffer on every read, then the setter writes into the instance's integers.
+ * Copying the bytes first does not depend on that layout: `copy.id = ...`
+ * changes the copy and leaves the id SDAM stored unchanged.
+ */
+function copyObjectId(id: ObjectId): ObjectId {
+  return new ObjectId(Uint8Array.from(id.id));
+}
+
+function copyTopologyVersion(version: TopologyVersion): TopologyVersion {
+  return {
+    processId: copyObjectId(version.processId),
+    // `Long.fromValue` allocates a new Long. Assigning `.low` on the shared
+    // counter would change staleness checks for the real description.
+    counter: Long.fromValue(version.counter)
+  };
+}
+
+function copyClusterTime(clusterTime: ClusterTime | undefined): ClusterTime | undefined {
+  if (clusterTime == null) {
+    return undefined;
+  }
+  // `t` and `i` are the two unsigned halves of the gossiped cluster time.
+  // `new Timestamp({ t, i })` stores them on a new Timestamp. The topology
+  // may later put this object on the wire, so the copy must not be the
+  // instance SDAM is still holding. `new Timestamp(existing)` also copies
+  // the bits in the current BSON library; the component form does not
+  // depend on that overload.
+  const copy: ClusterTime = {
+    clusterTime: new Timestamp({ t: clusterTime.clusterTime.t, i: clusterTime.clusterTime.i })
+  };
+  if (clusterTime.signature != null) {
+    copy.signature = {
+      // On Node, `value()` returns the Binary's own buffer, and
+      // `new Binary(existingBuffer)` keeps that buffer. Copy the bytes
+      // and preserve the subtype. `keyId` is a Long, so `fromValue`
+      // allocates one the callback can edit.
+      hash: new Binary(
+        Uint8Array.from(clusterTime.signature.hash.value()),
+        clusterTime.signature.hash.sub_type
+      ),
+      keyId: Long.fromValue(clusterTime.signature.keyId)
+    };
+  }
+  return copy;
+}
+
+/**
+ * `Object.assign` does not copy an Error usefully: `message` is often
+ * non-enumerable, and the label set is private. Build a new error and give
+ * it a new `topologyVersion`.
+ *
+ * A failed hello is a `MongoNetworkError` or `MongoNetworkTimeoutError`, and
+ * a server reply is a `MongoServerError`. Those keep their class so the
+ * callback can branch on them. Anything else becomes a `MongoError`. The
+ * server document is shallow-copied apart from `topologyVersion`. `cause`
+ * stays shared; it is not SDAM state.
+ */
+function copyError(error: MongoError): MongoError {
+  if (error instanceof MongoServerError) {
+    const response = { ...error.errorResponse };
+    if (response.topologyVersion != null) {
+      response.topologyVersion = copyTopologyVersion(response.topologyVersion);
+    }
+    // The constructor points the new instance's `topologyVersion` at the
+    // document copy. `finishErrorCopy` replaces it, because the stored
+    // description often uses one object for `description.topologyVersion`,
+    // `error.topologyVersion`, and `errorResponse.topologyVersion`.
+    return finishErrorCopy(error, new MongoServerError(response));
+  }
+
+  if (error instanceof MongoNetworkError) {
+    const ctor = error.constructor as new (
+      message: string,
+      options?: MongoNetworkErrorOptions
+    ) => MongoNetworkError;
+    return finishErrorCopy(
+      error,
+      new ctor(error.message, {
+        beforeHandshake: error.beforeHandshake,
+        cause: error.cause
+      })
+    );
+  }
+
+  return finishErrorCopy(
+    error,
+    new MongoError(error.message, error.cause == null ? undefined : { cause: error.cause })
+  );
+}
+
+function finishErrorCopy(source: MongoError, copy: MongoError): MongoError {
+  copy.code = source.code;
+  copy.connectionGeneration = source.connectionGeneration;
+  if (source.topologyVersion != null) {
+    copy.topologyVersion = copyTopologyVersion(source.topologyVersion);
+  }
+  for (const label of source.errorLabels) {
+    copy.addErrorLabel(label);
+  }
   return copy;
 }
 
@@ -398,14 +535,15 @@ export function applyUserServerSelector(
         'serverSelector must return an array of server descriptions'
       );
     }
+    // An empty array is the caller's way to say none of the eligible servers
+    // will do. The wait queue retries until serverSelectionTimeoutMS. A
+    // non-empty list is matched back to the original descriptions;
+    // serversReturnedByUser throws if any address was not eligible, so the
+    // matched list is non-empty whenever we get past that call.
     if (selected.length === 0) {
       return [];
     }
-    const narrowed = serversReturnedByUser(eligible, selected);
-    if (narrowed.length === 0) {
-      return [];
-    }
-    return latencyWindowReducer(topologyDescription, narrowed);
+    return latencyWindowReducer(topologyDescription, serversReturnedByUser(eligible, selected));
   };
 }
 

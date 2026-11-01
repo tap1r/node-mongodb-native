@@ -2,12 +2,17 @@ import { expect } from 'chai';
 
 import {
   applyUserServerSelector,
+  Binary,
   DeprioritizedServers,
+  Long,
   MIN_SECONDARY_WRITE_WIRE_VERSION,
   MongoClient,
   MongoInvalidArgumentError,
+  MongoNetworkError,
   MongoParseError,
+  MongoServerError,
   MongoServerSelectionError,
+  ObjectId,
   parseOptions,
   ReadPreference,
   readPreferenceServerSelector,
@@ -15,6 +20,7 @@ import {
   secondaryWritableServerSelector,
   ServerDescription,
   type ServerSelectorFunction,
+  Timestamp,
   TopologyDescription,
   TopologyType,
   writableServerSelector
@@ -272,6 +278,136 @@ describe('serverSelector', function () {
       expect(primary.hosts).to.deep.equal([]);
       expect(selected[0]).to.equal(primary);
       expect(selected[1]).to.equal(secondary);
+    });
+
+    it('keeps nested SDAM fields isolated from the filter', function () {
+      const electionId = new ObjectId();
+      const processId = new ObjectId();
+      const counter = Long.fromNumber(4);
+      const clusterTime = new Timestamp({ t: 2, i: 3 });
+      const keyId = Long.fromNumber(1);
+      const hash = new Binary(Uint8Array.from([1, 2, 3]));
+      // One topologyVersion object is stored on the description, on the server
+      // error, and inside that error's response document. Same for electionId
+      // and $clusterTime: the description keeps the hello's objects.
+      const topologyVersion = { processId, counter };
+      const error = new MongoServerError({
+        message: 'ping failed',
+        ok: 0,
+        topologyVersion
+      });
+      const described = new ServerDescription(
+        '127.0.0.1:27017',
+        {
+          setName: 'rs',
+          isWritablePrimary: true,
+          ok: 1,
+          electionId,
+          $clusterTime: { clusterTime, signature: { hash, keyId } }
+        },
+        { roundTripTime: 10, error }
+      );
+      expect(described.electionId).to.equal(electionId);
+      expect(described.topologyVersion).to.equal(error.topologyVersion);
+      expect(error.errorResponse.topologyVersion).to.equal(topologyVersion);
+      expect(described.$clusterTime?.clusterTime).to.equal(clusterTime);
+      expect(described.$clusterTime?.signature?.hash).to.equal(hash);
+
+      const selector = applyUserServerSelector(readPreference(ReadPreference.primary), servers => {
+        const seen = servers[0];
+        if (
+          seen.electionId == null ||
+          seen.topologyVersion == null ||
+          seen.$clusterTime?.signature == null ||
+          !(seen.error instanceof MongoServerError) ||
+          seen.error.topologyVersion == null ||
+          seen.error.errorResponse.topologyVersion == null
+        ) {
+          throw new Error('expected nested SDAM fields on the copy');
+        }
+        // Edit the copy in place. Replacing the property would hide a shared
+        // Long, ObjectId, Timestamp, or Binary.
+        const idBytes = Uint8Array.from(seen.electionId.id);
+        idBytes[0] ^= 0xff;
+        seen.electionId.id = idBytes;
+        seen.topologyVersion.processId = new ObjectId();
+        seen.topologyVersion.counter.low = 1;
+        seen.$clusterTime.clusterTime.low = 1;
+        seen.$clusterTime.signature.hash.value()[0] = 9;
+        seen.$clusterTime.signature.keyId.low = 9;
+        seen.error.message = 'changed';
+        seen.error.topologyVersion.counter.low = 7;
+        seen.error.errorResponse.message = 'changed response';
+        seen.error.errorResponse.topologyVersion.counter.low = 8;
+        return servers;
+      });
+
+      const selected = selector(
+        description(TopologyType.ReplicaSetWithPrimary, [described]),
+        [described],
+        new DeprioritizedServers()
+      );
+
+      expect(selected[0]).to.equal(described);
+      expect(described.electionId).to.equal(electionId);
+      expect(described.topologyVersion?.processId).to.equal(processId);
+      expect(described.topologyVersion?.counter.toNumber()).to.equal(4);
+      expect(described.$clusterTime?.clusterTime.t).to.equal(2);
+      expect(described.$clusterTime?.clusterTime.i).to.equal(3);
+      expect(Array.from(described.$clusterTime?.signature?.hash.value() ?? [])).to.deep.equal([
+        1, 2, 3
+      ]);
+      expect(described.$clusterTime?.signature?.keyId.toNumber()).to.equal(1);
+      expect(described.error).to.be.instanceOf(MongoServerError);
+      if (!(described.error instanceof MongoServerError)) {
+        throw new Error('expected the original MongoServerError');
+      }
+      expect(described.error.message).to.equal('ping failed');
+      expect(described.error.topologyVersion?.counter.toNumber()).to.equal(4);
+      expect(described.error.errorResponse.message).to.equal('ping failed');
+      expect(described.error.errorResponse.topologyVersion?.counter.toNumber()).to.equal(4);
+    });
+
+    it('keeps a network error class and isolates its topologyVersion', function () {
+      const processId = new ObjectId();
+      const counter = Long.fromNumber(4);
+      const topologyVersion = { processId, counter };
+      const error = new MongoNetworkError('connection closed', { beforeHandshake: false });
+      error.topologyVersion = topologyVersion;
+      error.addErrorLabel('ResetPool');
+      const described = new ServerDescription(
+        '127.0.0.1:27017',
+        { setName: 'rs', isWritablePrimary: true, ok: 1 },
+        { roundTripTime: 10, error }
+      );
+
+      let seenError: MongoNetworkError | undefined;
+      const selector = applyUserServerSelector(readPreference(ReadPreference.primary), servers => {
+        const seen = servers[0].error;
+        if (!(seen instanceof MongoNetworkError) || seen.topologyVersion == null) {
+          throw new Error('expected a MongoNetworkError copy');
+        }
+        seenError = seen;
+        seen.message = 'changed';
+        seen.topologyVersion.counter.low = 1;
+        seen.topologyVersion.processId = new ObjectId();
+        return servers;
+      });
+
+      const selected = selector(
+        description(TopologyType.ReplicaSetWithPrimary, [described]),
+        [described],
+        new DeprioritizedServers()
+      );
+
+      expect(selected[0]).to.equal(described);
+      expect(seenError).to.be.instanceOf(MongoNetworkError);
+      expect(seenError?.beforeHandshake).to.equal(false);
+      expect(seenError?.hasErrorLabel('ResetPool')).to.equal(true);
+      expect(error.message).to.equal('connection closed');
+      expect(error.topologyVersion?.processId).to.equal(processId);
+      expect(error.topologyVersion?.counter.toNumber()).to.equal(4);
+      expect(described.topologyVersion?.counter.toNumber()).to.equal(4);
     });
 
     it('rejects a server that was not eligible', function () {
